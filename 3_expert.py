@@ -1,8 +1,77 @@
-"""Expert settings example: layered sources and application lifecycle.
+"""EXPERT: define configuration policy and control its lifecycle.
+
+THEORY
+------
+Build on 2_intermediate.py by deciding exactly which sources participate,
+how deployment-wide constraints work, and when configuration is refreshed.
+
+1. Custom sources are an explicit policy
+   settings_customise_sources returns source objects in descending priority.
+   This example adds JsonConfigSettingsSource after file secrets, so deployment
+   credentials and environment overrides outrank the shipped JSON configuration.
+   Setting json_file alone does not activate that source. The JSON file is
+   optional here; malformed JSON fails loading. Its keys are field names such
+   as database, not environment names such as APP_DATABASE.
+   Sources produce dictionaries. Nested mappings merge across sources before
+   validation: an environment host can replace the JSON host while retaining
+   JSON pool_size. This does not mean arbitrary lists merge element by element.
+
+2. Secrets have a bootstrap problem
+   A secrets directory must be known before settings are loaded. get_settings()
+   reads APP_SECRETS_DIR from the process environment and passes _secrets_dir.
+   Putting APP_SECRETS_DIR only in .env will not configure that directory.
+   A file named APP_API_KEY supplies the top-level api_key field. Ordinary file
+   secrets do not automatically interpret nested filenames like the environment
+   delimiter. A missing configured directory warns; an absent production key
+   fails the validator. SecretStr masks display but is not encryption.
+
+3. Cross-field invariants express resource budgets
+   Each worker owns a connection pool. workers * database.pool_size must fit
+   max_database_connections. Checking each field separately cannot enforce this.
+   A production deployment additionally requires a non-empty API key.
+
+4. Cache at the application boundary
+   Construct settings at startup and inject the instance into components.
+   lru_cache avoids repeated source reads and returns one snapshot per process.
+   reload_settings clears the cache and reconstructs it; existing references
+   retain their old values. Reload at a controlled boundary: cache clearing is
+   not a coordinated configuration rollout across threads or worker processes.
+   If reconstruction fails, callers receive the error; there is no automatic
+   fallback to the previous snapshot in this example.
+
+5. Immutability and diagnostics
+   frozen=True prevents field reassignment. Nested models are separately frozen;
+   frozen models are not deeply immutable if you add mutable lists or dicts.
+   hide_input_in_errors hides input values in formatted validation messages;
+   structured errors can still include inputs. Avoid logging entire settings or
+   error payloads containing credentials. Keep secret files outside the repo.
+
+EXAMPLE WALKTHROUGH
+-------------------
+With JSON port=8100, dotenv port=8200, and environment APP_PORT=8300, the result
+is 8300. Settings(port=8400) wins over all three. JSON pool_size=10 survives an
+environment override of database.host. workers=4 and pool_size=50 exceed the
+100-connection budget and fail. Production without an API key also fails.
+
+TESTING AND PRACTICE
+--------------------
+Control every source when testing: use a clean environment, _env_file=None,
+a temporary secrets directory, and a temporary JSON path (via a Settings
+subclass with its own model_config). Disabling dotenv does not disable JSON,
+secrets, or environment loading. Clear get_settings.cache_clear() around tests
+that change environment variables. Check successful precedence, invalid budgets,
+and secret masking without printing the underlying key.
+
+Try changing APP_PORT after calling get_settings(): the cached instance stays
+unchanged until reload_settings(). Then compare both object identity and port.
+For another extension, register a custom source that reads a deployment service;
+keep network access, credentials, timeouts, and failure policy explicit there.
+
+Expert settings example: layered sources and application lifecycle.
 
 Requires Python 3.10+:
     python3 -m pip install 'pydantic-settings>=2,<3'
-    python3 3_practice.py
+    python3 3_expert.py
 
 Optional config.3.json beside this script (JSON keys use Python field names):
     {
@@ -15,14 +84,14 @@ Optional .env beside this script:
     APP_DATABASE__POOL_SIZE=15
 
 Try environment overrides and validation:
-    APP_PORT=8300 APP_DATABASE__HOST=db.example.com python3 3_practice.py
-    APP_DATABASE__POOL_SIZE=50 APP_WORKERS=4 python3 3_practice.py
-    APP_ENVIRONMENT=production python3 3_practice.py
-    APP_ENVIRONMENT=production APP_API_KEY=practice-only python3 3_practice.py
+    APP_PORT=8300 APP_DATABASE__HOST=db.example.com python3 3_expert.py
+    APP_DATABASE__POOL_SIZE=50 APP_WORKERS=4 python3 3_expert.py
+    APP_ENVIRONMENT=production python3 3_expert.py
+    APP_ENVIRONMENT=production APP_API_KEY=practice-only python3 3_expert.py
 
 To load a file secret, create a private directory outside the repository,
 put a practice key in a file named APP_API_KEY, then run:
-    APP_SECRETS_DIR=/absolute/path/to/private-secrets python3 3_practice.py
+    APP_SECRETS_DIR=/absolute/path/to/private-secrets python3 3_expert.py
 
 Priority (highest first): constructor > environment > dotenv > secrets > JSON
 > field defaults. Nested dictionaries merge across sources, so overriding a
