@@ -98,12 +98,109 @@ Priority (highest first): constructor > environment > dotenv > secrets > JSON
 single database field preserves other fields from lower-priority sources.
 
 Reference: https://docs.pydantic.dev/latest/concepts/pydantic_settings/
+CUSTOM SOURCE DESIGN IN DETAIL
+------------------------------
+A settings source is a callable returning a mapping of field names to values.
+The hook below receives already-configured constructor, environment, dotenv,
+and secret sources. Keep those objects: they respect runtime overrides such as
+_env_file and _secrets_dir. Adding a file source is simpler than writing a parser.
+Use settings_cls in JsonConfigSettingsSource so subclasses can override paths.
+
+A source can supply a small mapping via an ordinary callable:
+    def deployment_defaults() -> dict[str, object]:
+        return {"workers": 3}
+Then include deployment_defaults in the returned tuple at the desired priority.
+For sources needing per-field logic or earlier-source results, subclass
+PydanticBaseSettingsSource and implement get_field_value and __call__.
+Its current_state exposes values accumulated by preceding sources. Do not
+assume lower-priority file/network sources are skipped just because a higher
+source supplies a value: source collection can still perform their I/O.
+
+Do not silently swallow a malformed configuration file or unavailable required
+secret backend. Decide whether a remote source is required or optional, set
+bounded timeouts, and expose a useful startup error without credentials.
+Sources load synchronously here: avoid repeated construction in async request
+handlers, and perform startup loading outside latency-sensitive request paths.
+
+PRECEDENCE IS ALSO A SECURITY AND OPERATIONS DECISION
+----------------------------------------------------
+This lesson deliberately lets environment and dotenv override secret files.
+That can be convenient locally, but another deployment may place secret files
+above dotenv. Reorder the tuple to express that policy and test collisions.
+Do not put secret values in the shipped JSON example. Treat file permissions,
+secret distribution, and rotation as deployment responsibilities.
+
+extra="ignore" is chosen for the shared .env used by these lessons. It also
+ignores unknown top-level keys from JSON and constructors. For a dedicated app,
+extra="forbid" usually catches misspelled options earlier. The nested database
+model independently forbids extra keys. Prefer a single documented schema over
+having several sources use unrelated names for the same concept.
+
+COMMAND-LINE CONFIGURATION AS AN OPTIONAL EXTENSION
+---------------------------------------------------
+These modules do not parse CLI arguments automatically. At a script boundary,
+settings can opt into the built-in CLI:
+    settings = Settings(_cli_parse_args=["--port", "8500"])
+By default an enabled CLI source outranks constructor arguments. A bool option
+normally takes a value; cli_implicit_flags=True enables flags such as --debug
+and --no-debug on a model with a debug field. Do not enable argument parsing in
+a reusable library's import path: the host may have its own arguments.
+
+PERFORMANCE: WHAT TO OPTIMIZE AND WHAT TO KEEP
+--------------------------------------------
+Loading settings includes environment scans, file reads, conversion, and
+validation. The useful optimization is to load once at startup and reuse the
+validated object. Database clients should also be initialized once with that
+configuration, rather than creating new settings and clients for every query.
+The load_settings helper centralizes the bootstrap directory so explicit
+constructor demonstrations and the cached provider use identical sources.
+
+Keep validation enabled. model_construct() bypasses validation and is not an
+appropriate shortcut for untrusted deployment input. model_copy(update=...)
+does not validate the update either; use a normal Settings constructor to
+revalidate source values plus explicit overrides. Caching credentials does not
+implement secret rotation: recreating configuration does not automatically
+reconnect database pools or update API clients already holding old values.
+
+lru_cache protects its own internal cache state, but concurrent initial calls
+can still execute the wrapped function more than once. Warm the cache during
+startup if initialization must happen predictably. This small example does not
+provide transactional reload or retain the last good snapshot after failure.
+A service requiring those guarantees should validate a candidate configuration
+and its dependent resources before publishing it under a coordinated mechanism.
+
+SAFE, REPEATABLE VERIFICATION
+-----------------------------
+For an isolated test subclass:
+    class TestSettings(Settings):
+        model_config = SettingsConfigDict(env_file=None, json_file=None)
+The parent model_config options are inherited; the two file sources are disabled.
+Use a temporary directory via _secrets_dir and remove matching APP_* variables
+with a test fixture. Then verify actual behavior, for example:
+    assert TestSettings(port=8700).port == 8700
+    # Set APP_PORT=8600 in a controlled fixture:
+    assert TestSettings().port == 8600
+    assert TestSettings(port=8700).port == 8700
+Also test a nested merge from JSON, a secrets-file override, an invalid resource
+budget, a blank production key, and cache refresh. Restore the environment and
+clear caches in finally blocks or fixture cleanup so one test cannot affect
+another. Do not mutate the process environment concurrently in application code.
+
+EXTENSION EXERCISES
+-------------------
+1. Place file secrets ahead of dotenv and verify a collision using dummy values.
+2. Add a custom mapping source and document where it belongs in the tuple.
+3. Set frozen fields and confirm reassignment raises ValidationError.
+4. Explain why reloading settings alone cannot rotate an existing API client.
+5. Compare formatted validation errors with errors(include_input=False), and
+   avoid exposing either payload until nested context has also been reviewed.
+
 """
 
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import (
@@ -175,11 +272,20 @@ class Settings(BaseSettings):
         return self
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
+def load_settings(**overrides: Any) -> Settings:
+    """Apply the same bootstrap policy for cached and explicitly overridden loads."""
     # APP_SECRETS_DIR is a bootstrap option read from the process environment.
     # No directory is configured by default, so a plain run needs no extra files.
-    return Settings(_secrets_dir=os.environ.get("APP_SECRETS_DIR"))
+    return Settings(
+        _secrets_dir=os.environ.get("APP_SECRETS_DIR"),
+        **overrides,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Reuse the validated startup snapshot within this process."""
+    return load_settings()
 
 
 def reload_settings() -> Settings:
@@ -188,7 +294,8 @@ def reload_settings() -> Settings:
     return get_settings()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Load configuration at the script boundary and demonstrate its behavior."""
     settings = get_settings()
     print(f"Environment: {settings.environment}; port: {settings.port}")
     print(f"Database: {settings.database.host}:{settings.database.port}")
@@ -198,6 +305,10 @@ if __name__ == "__main__":
     print(f"Cached instance reused: {get_settings() is settings}")
 
     # Constructor overrides remain highest priority for isolated instances.
-    print(f"Explicit port override: {Settings(port=8400).port}")
+    print(f"Explicit port override: {load_settings(port=8400).port}")
     # Call reload_settings() only at a controlled application lifecycle boundary.
     # Existing consumers retain their old instance; the cache is per process.
+
+
+if __name__ == "__main__":
+    main()
